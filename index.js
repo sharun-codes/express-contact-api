@@ -4,53 +4,88 @@ const nodemailer = require('nodemailer')
 const helmet = require('helmet')
 const xss = require('xss')
 const { RateLimiterMemory } = require('rate-limiter-flexible')
+const crypto = require('crypto');
+const { timingSafeEqual } = crypto;
+const cookieParser = require('cookie-parser');
 
-require('dotenv').config()
+require('dotenv').config();
 
-const app = express()
-const PORT = process.env.PORT || 3001
+const app = express();
+const PORT = process.env.PORT || 3001;
 
 // security
-app.use(helmet())
-app.use(express.json({ limit: '6kb' })) // limit payloads
-app.use(express.urlencoded({ extended: true }))
+app.use(helmet());
+app.use(express.json({ limit: '6kb' })); // limit payloads
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
-const allowedOrigins = (process.env.CORS_ORIGIN).split(',').map(s => s.trim())
+const allowedOrigins = process.env.CORS_ORIGIN.split(',').map((s) => s.trim());
 
 const corsOptions = {
-  origin: function (origin, callback) {
-    // allow non-browser tools like curl where origin is undefined/null
-    if (!origin) return callback(null, true)
+    origin: function (origin, callback) {
+        // allow non-browser tools like curl where origin is undefined/null
+        if (!origin) return callback(null, true);
 
-    // allow exact match
-    if (allowedOrigins.includes(origin)) return callback(null, true)
+        // allow exact match
+        if (allowedOrigins.includes(origin)) return callback(null, true);
 
-    // otherwise block
-    callback(new Error('CORS policy: origin not allowed'), false)
-  },
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type'],
-  optionsSuccessStatus: 204,
-}
+        // otherwise block
+        callback(new Error('CORS policy: origin not allowed'), false);
+    },
+    credentials: true, //allow the browser to send cookies
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'X-CSRF-Token'],
+    optionsSuccessStatus: 204,
+};
 
-app.use(cors(corsOptions))
+app.use(cors(corsOptions));
 // ensure preflight replies are handled
-app.options('*', cors(corsOptions))
+app.options('*', cors(corsOptions));
 
 // simple rate limiter
 const rateLimiter = new RateLimiterMemory({
-  points: parseInt(process.env.RATE_LIMIT_POINTS || '6', 10), // requests
-  duration: parseInt(process.env.RATE_LIMIT_WINDOW || '60', 10), // per seconds
-})
+    points: parseInt(process.env.RATE_LIMIT_POINTS || '6', 10), // requests
+    duration: parseInt(process.env.RATE_LIMIT_WINDOW || '60', 10), // per seconds
+});
 
 // helpers
 function sanitize(input = '') {
-  // basic cleaning - since we already have server-side validation; xss can sanitize HTML
-  return xss(String(input || '').trim()).slice(0, 5000)
+    // basic cleaning - since we already have server-side validation; xss can sanitize HTML
+    return xss(String(input || '').trim()).slice(0, 5000);
+}
+
+// helper to generate token
+function generateCsrfToken() {
+    return crypto.randomBytes(32).toString('hex'); // 64 chars
+}
+
+// CSRF validation middleware
+function validateCsrf(req, res, next) {
+    try {
+        const headerToken = req.get('x-csrf-token') || '';
+        const cookieToken = req.cookies['csrf_token'] || '';
+
+        if (!headerToken || !cookieToken) {
+            return res.status(403).json({ error: 'csrf_missing' });
+        }
+
+        const h = Buffer.from(String(headerToken));
+        const c = Buffer.from(String(cookieToken));
+        if (h.length !== c.length)
+            return res.status(403).json({ error: 'csrf_mismatch' });
+
+        if (!crypto.timingSafeEqual(h, c)) {
+            return res.status(403).json({ error: 'csrf_mismatch' });
+        }
+
+        next();
+    } catch (err) {
+        return res.status(403).json({ error: 'csrf_error' });
+    }
 }
 
 function buildHtmlEmail({ name, email, message }) {
-  return `<!DOCTYPE html>
+    return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <style>
   body{font-family:Arial,sans-serif;background:#f4f4f4;margin:0;padding:0}
@@ -71,89 +106,125 @@ function buildHtmlEmail({ name, email, message }) {
     <p>Be sure to follow up with this inquiry as soon as possible.</p>
     <div class="footer"><p>&copy; Sharun - Portfolio</p></div>
   </div>
-</body></html>`
+</body></html>`;
 }
 
 // transport factory (create once)
 function createTransporter() {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env
-  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
-    throw new Error('Missing SMTP env vars')
-  }
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: Number(SMTP_PORT) === 465, // true for 465
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  })
+    const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+    if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
+        throw new Error('Missing SMTP env vars');
+    }
+    return nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: Number(SMTP_PORT),
+        secure: Number(SMTP_PORT) === 465, // true for 465
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+    });
 }
 
 const transporter = (() => {
-  try {
-    return createTransporter()
-  } catch (err) {
-    console.error('SMTP not configured yet:', err.message)
-    return null
-  }
-})()
+    try {
+        return createTransporter();
+    } catch (err) {
+        console.error('SMTP not configured yet:', err.message);
+        return null;
+    }
+})();
 
 // health
-app.get('/api/health', (req, res) => res.json({ ok: true }))
+app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-// contact endpoint
-app.post('/api/contact', async (req, res) => {
-  try {
-    // rate limit by IP
-    const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress || 'unknown'
+// route to set CSRF cookie and return token
+app.get('/api/csrf', (req, res) => {
+    const token = generateCsrfToken();
+    const isProd = process.env.NODE_ENV === 'production';
 
-    await rateLimiter.consume(ip)
-
-    const { name, email, message, _hp } = req.body || {}
-
-    // honeypot spam trap
-    if (_hp) {
-      return res.status(400).json({ error: 'spam' })
-    }
-
-    // basic validation
-    if (!name || !email || !message) {
-      return res.status(400).json({ error: 'missing_fields' })
-    }
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-    if (!emailRegex.test(String(email))) {
-      return res.status(400).json({ error: 'invalid_email' })
-    }
-
-    // sanitize
-    const safeName = sanitize(name).slice(0, 200)
-    const safeEmail = sanitize(email).slice(0, 200)
-    const safeMessage = sanitize(message).slice(0, 5000)
-
-    if (!transporter) {
-      console.error('Transporter not ready')
-      return res.status(500).json({ error: 'server_misconfigured' })
-    }
-
-    const html = buildHtmlEmail({ name: safeName, email: safeEmail, message: safeMessage })
-    const mailOptions = {
-        from: `"Hi from ${safeName}" <${process.env.SENDER_EMAIL || process.env.SMTP_USER}>`,
-        to: process.env.RECEIVER_EMAIL,
-        replyTo: safeEmail,
-        subject: `Portfolio contact from ${safeName}`,
-        html,
+    const cookieOptions = {
+        httpOnly: false, // double-submit expects JS to read it
+        path: '/',
+        maxAge: 1000 * 60 * 60, // 1 hour
     };
 
-    await transporter.sendMail(mailOptions)
-    return res.status(200).json({ ok: true })
-  } catch (err) {
-    if (err instanceof Error && err.msBeforeNext) {
-      // rate-limiter-flexible returns msBeforeNext on consumed errors
-      return res.status(429).json({ error: 'rate_limited' })
+    if (isProd) {
+        // Production: set domain to apex so it shares between subdomains
+        const domain = process.env.CSRF_COOKIE_DOMAIN || '.sharunk.com';
+        cookieOptions.domain = domain;
+        cookieOptions.sameSite = 'None'; // Required for cross-site cookie sending with fetch
+        cookieOptions.secure = true; // must be HTTPS
+    } else {
+        // Local: do NOT set domain, SameSite=Lax, secure=false
+        cookieOptions.sameSite = 'Lax';
+        cookieOptions.secure = false;
     }
-    console.error('Contact send failed:', err)
-    return res.status(500).json({ error: 'failed_to_send' })
-  }
-})
+
+    // Set cookie and reply with token in JSON
+    res.cookie('csrf_token', token, cookieOptions);
+    return res.json({ csrfToken: token });
+});
+
+// contact endpoint
+app.post('/api/contact', validateCsrf, async (req, res) => {
+    try {
+        // rate limit by IP
+        const ip =
+            req.ip ||
+            req.headers['x-forwarded-for'] ||
+            req.connection.remoteAddress ||
+            'unknown';
+
+        await rateLimiter.consume(ip);
+
+        const { name, email, message, _hp } = req.body || {};
+
+        // honeypot spam trap
+        if (_hp) {
+            return res.status(400).json({ error: 'spam' });
+        }
+
+        // basic validation
+        if (!name || !email || !message) {
+            return res.status(400).json({ error: 'missing_fields' });
+        }
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(String(email))) {
+            return res.status(400).json({ error: 'invalid_email' });
+        }
+
+        // sanitize
+        const safeName = sanitize(name).slice(0, 200);
+        const safeEmail = sanitize(email).slice(0, 200);
+        const safeMessage = sanitize(message).slice(0, 5000);
+
+        if (!transporter) {
+            console.error('Transporter not ready');
+            return res.status(500).json({ error: 'server_misconfigured' });
+        }
+
+        const html = buildHtmlEmail({
+            name: safeName,
+            email: safeEmail,
+            message: safeMessage,
+        });
+        const mailOptions = {
+            from: `"Hi from ${safeName}" <${process.env.SENDER_EMAIL || process.env.SMTP_USER}>`,
+            to: process.env.RECEIVER_EMAIL,
+            replyTo: safeEmail,
+            subject: `Portfolio contact from ${safeName}`,
+            html,
+        };
+
+        await transporter.sendMail(mailOptions);
+        return res.status(200).json({ ok: true });
+    } catch (err) {
+        if (err instanceof Error && err.msBeforeNext) {
+            // rate-limiter-flexible returns msBeforeNext on consumed errors
+            return res.status(429).json({ error: 'rate_limited' });
+        }
+        console.error('Contact send failed:', err);
+        return res.status(500).json({ error: 'failed_to_send' });
+    }
+});
 
 const server = app.listen(PORT, () => {
   console.log(`Contact API running on port ${PORT}`)
