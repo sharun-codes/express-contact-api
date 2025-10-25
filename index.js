@@ -136,12 +136,12 @@ app.post('/api/contact', async (req, res) => {
 
     const html = buildHtmlEmail({ name: safeName, email: safeEmail, message: safeMessage })
     const mailOptions = {
-      from: process.env.SENDER_EMAIL || process.env.SMTP_USER,
-      to: process.env.RECEIVER_EMAIL,
-      replyTo: safeEmail,
-      subject: `Portfolio contact from ${safeName}`,
-      html,
-    }
+        from: `"Hi from ${safeName}" <${process.env.SENDER_EMAIL || process.env.SMTP_USER}>`,
+        to: process.env.RECEIVER_EMAIL,
+        replyTo: safeEmail,
+        subject: `Portfolio contact from ${safeName}`,
+        html,
+    };
 
     await transporter.sendMail(mailOptions)
     return res.status(200).json({ ok: true })
